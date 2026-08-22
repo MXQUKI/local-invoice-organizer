@@ -1,0 +1,3 @@
+# Only needed when creating a single-file executable with PyInstaller.
+pyinstaller>=6.0
+Pillow>=10.0

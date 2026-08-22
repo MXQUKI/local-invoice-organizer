@@ -1,0 +1,5 @@
+#!/bin/zsh
+set -e
+ROOT="$(cd "$(dirname "$0")/../Resources" && pwd)"
+cd "$ROOT"
+exec /usr/bin/env python3 app.py --open-browser

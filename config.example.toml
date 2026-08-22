@@ -1,0 +1,13 @@
+# Copy this file to config.toml and fill in your own key.
+# Do not commit config.toml; it is ignored by .gitignore.
+
+[vlm]
+enabled = false
+provider = "deepseek"
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-v4-flash-vision-exp"
+api_key = ""
+# Or leave api_key empty and set the environment variable named below.
+api_key_env = "DEEPSEEK_API_KEY"
+timeout_seconds = 90
+max_tokens = 1800

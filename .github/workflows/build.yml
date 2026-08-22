@@ -1,0 +1,29 @@
+name: build-packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m pip install -r requirements-build.txt
+      - run: .\build_windows.bat
+      - uses: actions/upload-artifact@v4
+        with: { name: local-invoice-organizer-windows, path: dist/本地发票整理.exe }
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m pip install -r requirements-build.txt
+      - run: chmod +x build_macos.sh && ./build_macos.sh
+      - uses: actions/upload-artifact@v4
+        with: { name: local-invoice-organizer-macos, path: dist/本地发票整理.dmg }
