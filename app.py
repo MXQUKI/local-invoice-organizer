@@ -592,7 +592,7 @@ class Store:
         (BATCH_ROOT / batch_id / "uploads").mkdir(parents=True, exist_ok=True)
         return self.get_batch(batch_id)  # type: ignore[return-value]
 
-    def upload(self, batch_id: str, category: str, filename: str, content: bytes) -> dict[str, Any]:
+    def upload(self, batch_id: str, category: str, filename: str, content: bytes, defer_validation: bool = False) -> dict[str, Any]:
         if category not in UPLOAD_CATEGORIES:
             raise ValueError("当前只支持上传：发票、购买凭证")
         ext = Path(filename).suffix.casefold()
@@ -640,8 +640,11 @@ class Store:
                 (file_id, batch_id, original_name, stored_name, category, str(path), digest, len(content), method, json_dumps(fields), status, json_dumps(errors), "", None, now_iso(), None, 0),
             )
             self.db.commit()
-        self.auto_match_by_amount(batch_id)
-        self.validate(batch_id)
+        # 批量上传时由前端在全部文件完成后统一匹配和核验，避免每个文件
+        # 都重复扫描整个批次。直接调用接口时仍保持原来的即时核验行为。
+        if not defer_validation:
+            self.auto_match_by_amount(batch_id)
+            self.validate(batch_id)
         return self.get_file(file_id)
 
     def delete_batch(self, batch_id: str) -> None:
@@ -1115,13 +1118,14 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 MATCH_JS = r"""
 let selectedCredentialIds=new Set();
 const uploadJobs=new Map();
+let uploadRenderQueued=false;
 function captureScrollState(){const selectors=['window','.grid>aside','.batch-list','#workspace','.match-board','.credential-dock','.invoice-column','.files-scroll','.error-list'];const state={};for(const selector of selectors){if(selector==='window'){state.window={x:window.scrollX,y:window.scrollY};continue}document.querySelectorAll(selector).forEach((element,index)=>{state[`${selector}:${index}`]={x:element.scrollLeft,y:element.scrollTop}})}return state}
 function restoreScrollState(state){if(!state)return;requestAnimationFrame(()=>{for(const [key,position] of Object.entries(state)){if(key==='window'){window.scrollTo(position.x,position.y);continue}const split=key.lastIndexOf(':');const selector=key.slice(0,split);const index=Number(key.slice(split+1));const element=document.querySelectorAll(selector)[index];if(element){element.scrollLeft=position.x;element.scrollTop=position.y}}requestAnimationFrame(()=>{for(const [key,position] of Object.entries(state)){if(key==='window')continue;const split=key.lastIndexOf(':');const selector=key.slice(0,split);const index=Number(key.slice(split+1));const element=document.querySelectorAll(selector)[index];if(element){element.scrollLeft=position.x;element.scrollTop=position.y}}})})}
 function showErrorToast(message){let stack=document.querySelector('.toast-stack');if(!stack){stack=document.createElement('div');stack.className='toast-stack';document.body.appendChild(stack)}const toast=document.createElement('div');toast.className='toast-error';toast.innerHTML=`<div><strong>处理失败</strong><div>${esc(message)}</div></div><button class="toast-close" aria-label="关闭">×</button>`;toast.querySelector('.toast-close').onclick=()=>toast.remove();stack.appendChild(toast);setTimeout(()=>toast.remove(),9000)}
 function renderCredentialUploadProgress(){const host=$('#credentialUploadProgress');if(!host)return;const jobs=Array.from(uploadJobs.values());if(!jobs.length){host.innerHTML='';return}host.innerHTML=`<div class="credential-upload-panel"><div class="credential-upload-title">凭证上传与 DeepSeek 处理进度</div><div class="credential-upload-subtitle">上传完成后进入图片理解；模型不确定时会转人工复核</div>${jobs.map(job=>`<div class="upload-job"><div class="upload-job-name" title="${esc(job.name)}">${esc(job.name)}</div><div class="upload-job-track"><div class="upload-job-fill ${job.indeterminate?'indeterminate':''}" style="width:${job.progress}%"></div></div><div class="upload-job-status ${job.stage==='失败'?'error':job.stage.includes('完成')?'done':''}">${esc(job.stage)} ${job.stage==='上传中'?job.progress+'%':''}</div></div>`).join('')}</div>`}
-function updateUploadJob(id,patch){const old=uploadJobs.get(id)||{};uploadJobs.set(id,{...old,...patch});renderCredentialUploadProgress()}
+function updateUploadJob(id,patch){const old=uploadJobs.get(id)||{};uploadJobs.set(id,{...old,...patch});if(uploadRenderQueued)return;uploadRenderQueued=true;const flush=()=>{uploadRenderQueued=false;renderCredentialUploadProgress()};if(window.requestAnimationFrame)window.requestAnimationFrame(flush);else window.setTimeout(flush,50)}
 async function runUploadTasks(files,category,limit=20){let cursor=0;const workers=Array.from({length:Math.min(limit,files.length)},async()=>{while(true){const index=cursor++;if(index>=files.length)return;const file=files[index];try{await uploadCredentialFile(file,category)}catch(error){showErrorToast(file.name+'：'+error.message)}}});await Promise.all(workers)}
-function uploadCredentialFile(file,category){const id=crypto.randomUUID?crypto.randomUUID():`${Date.now()}-${Math.random()}`;updateUploadJob(id,{name:file.name,progress:0,stage:'上传中',indeterminate:false});return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.open('POST','/api/batches/'+current.id+'/upload');xhr.upload.onprogress=event=>{if(event.lengthComputable){const progress=Math.round(event.loaded/event.total);updateUploadJob(id,{progress,stage:progress>=100?'DeepSeek 处理中':'上传中',indeterminate:progress>=100})}};xhr.onerror=()=>{updateUploadJob(id,{stage:'失败',progress:0,indeterminate:false});reject(new Error('上传失败'))};xhr.onload=async()=>{if(xhr.status<200||xhr.status>=300){updateUploadJob(id,{stage:'失败',indeterminate:false});try{const error=JSON.parse(xhr.responseText);reject(new Error(error.error||'上传失败'))}catch(e){reject(new Error('上传失败'))}return}try{const result=JSON.parse(xhr.responseText);const method=result.recognition_method||'';const stage=result.duplicate_removed?'重复文件已删除':method.includes('DeepSeek')?'DeepSeek 已完成':method.includes('Vision')?'本地 Vision 已完成':'OCR 已完成';updateUploadJob(id,{progress:100,stage,indeterminate:false});resolve(result)}catch(e){updateUploadJob(id,{stage:'失败',indeterminate:false});reject(new Error('服务器返回无效'))}};const fd=new FormData();fd.append('category',category);fd.append('file',file);xhr.send(fd)})}
+function uploadCredentialFile(file,category){const id=crypto.randomUUID?crypto.randomUUID():`${Date.now()}-${Math.random()}`;updateUploadJob(id,{name:file.name,progress:0,stage:'上传中',indeterminate:false});return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.open('POST','/api/batches/'+current.id+'/upload');xhr.setRequestHeader('X-Defer-Validation','1');xhr.upload.onprogress=event=>{if(event.lengthComputable){const progress=Math.round(event.loaded/event.total);updateUploadJob(id,{progress,stage:progress>=100?'DeepSeek 处理中':'上传中',indeterminate:progress>=100})}};xhr.onerror=()=>{updateUploadJob(id,{stage:'失败',progress:0,indeterminate:false});reject(new Error('上传失败'))};xhr.onload=async()=>{if(xhr.status<200||xhr.status>=300){updateUploadJob(id,{stage:'失败',progress:0,indeterminate:false});try{const error=JSON.parse(xhr.responseText);reject(new Error(error.error||'上传失败'))}catch(e){reject(new Error('上传失败'))}return}try{const result=JSON.parse(xhr.responseText);const method=result.recognition_method||'';const stage=result.duplicate_removed?'重复文件已删除':method.includes('DeepSeek')?'DeepSeek 已完成':method.includes('Vision')?'本地 Vision 已完成':'OCR 已完成';updateUploadJob(id,{progress:100,stage,indeterminate:false});resolve(result)}catch(e){updateUploadJob(id,{stage:'失败',progress:0,indeterminate:false});reject(new Error('服务器返回无效'))}};const fd=new FormData();fd.append('category',category);fd.append('file',file);xhr.send(fd)})}
 function previewButton(file){return `<button class="preview-name" onclick="event.stopPropagation();previewFile('${file.id}')">${esc(file.original_name)}</button>`}
 function credentialLabel(file){const x=file.fields||{};const amount=x.payment_amount??x.order_amount??x.refund_amount;const token=x.order_number||x.transaction_number||'';const source=x.payment_amount_source?`（${esc(x.payment_amount_source)}）`:'';return `<div class="credential-main"><strong>${previewButton(file)}</strong><small>${esc(file.category)}${amount!==undefined&&amount!==null?' · 金额 '+esc(amount)+source:''}${token?' · 订单 '+esc(token):''}</small></div>`}
 function invoiceLabel(file){const x=file.fields||{};return `<div class="invoice-head"><div><div class="invoice-name">${previewButton(file)}</div><div class="small">发票金额：${esc(x.invoice_amount??'待补录')} · 发票号码：${esc(x.invoice_number??'待补录')}</div></div>${status(file.status)}</div>`}
@@ -1207,7 +1211,7 @@ class Handler(BaseHTTPRequestHandler):
                 "const r=await fetch('/api/batches/'+current.id+'/upload',{method:'POST',body:fd});const d=await r.json();if(!r.ok){alert(d.error||'上传失败')}else if(d.duplicate_removed){alert(d.message||'重复文件已删除')}",
             ).replace(
                 "async function uploadFiles(e){const cat=$('#uploadCategory').value;for(const file of e.target.files){const fd=new FormData();fd.append('category',cat);fd.append('file',file);const r=await fetch('/api/batches/'+current.id+'/upload',{method:'POST',body:fd});if(!r.ok){const d=await r.json();alert(d.error||'上传失败')}}await selectBatch(current.id)}",
-                "async function uploadFiles(e){const cat=$('#uploadCategory').value;const files=Array.from(e.target.files);await runUploadTasks(files,cat,20);await selectBatch(current.id)}",
+                "async function uploadFiles(e){const cat=$('#uploadCategory').value;const files=Array.from(e.target.files);await runUploadTasks(files,cat,20);await api('/api/batches/'+current.id+'/validate',{method:'POST'});await selectBatch(current.id)}",
             ).replace(
                 "async function selectBatch(id){current=await api('/api/batches/'+id);render();loadBatches()}",
                 "async function selectBatch(id){const scrollState=captureScrollState();current=await api('/api/batches/'+id);render();await loadBatches();restoreScrollState(scrollState)}",
@@ -1330,8 +1334,9 @@ class Handler(BaseHTTPRequestHandler):
                     elif name == "file":
                         filename = part.get_filename() or filename
                         file_content = part.get_payload(decode=True) or b""
+                defer_validation = self.headers.get("X-Defer-Validation", "").lower() in {"1", "true", "yes"}
                 with OCR_SEMAPHORE:
-                    result = STORE.upload(m.group(1), category, filename, file_content)
+                    result = STORE.upload(m.group(1), category, filename, file_content, defer_validation=defer_validation)
                 self.send_json(result, 201); return
             m = re.fullmatch(r"/api/batches/([^/]+)/(validate|archive)", path)
             if m:

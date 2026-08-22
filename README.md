@@ -140,7 +140,7 @@ $env:DEEPSEEK_VISION_ENABLED = "1"
 py app.py --open-browser
 ~~~
 
-默认 Base URL 为 https://api.deepseek.com，模型为 deepseek-v4-flash-vision-exp。可用 DEEPSEEK_BASE_URL、DEEPSEEK_MODEL 和 DEEPSEEK_TIMEOUT 覆盖。程序使用 /chat/completions 接口，以 Base64 data:image/... 的 image_url 发送图片。
+默认 Base URL 为 https://api.deepseek.com，模型为 deepseek-v4-flash-vision-exp。可用 DEEPSEEK_BASE_URL、DEEPSEEK_MODEL 和 DEEPSEEK_TIMEOUT 覆盖。程序使用 /chat/completions 接口，以原始图片字节编码为 Base64 data:image/... 的 image_url 发送，不会压缩或修改凭证图片。批量上传时，系统会并发处理最多 20 个文件，并在全部上传完成后统一执行一次匹配和核验，避免重复扫描批次。
 
 测试 API：
 

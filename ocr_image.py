@@ -89,10 +89,11 @@ def get_deepseek_api_key() -> str | None:
 
 
 def deepseek_image_data_url(image_path: Path) -> str:
+    """Build a Base64 data URL from the original image bytes, unchanged."""
+    data = image_path.read_bytes()
     media_type = mimetypes.guess_type(image_path.name)[0] or "image/png"
     if media_type not in {"image/jpeg", "image/png", "image/gif", "image/webp"}:
         media_type = "image/png"
-    data = image_path.read_bytes()
     return f"data:{media_type};base64,{base64.b64encode(data).decode('ascii')}"
 
 
