@@ -53,7 +53,7 @@ BATCH_ROOT = DATA_ROOT / "batches"
 ARCHIVE_ROOT = DATA_ROOT / "archives"
 DB_PATH = DATA_ROOT / "invoice.db"
 PORT = 8765
-OCR_CONCURRENCY = 20
+OCR_CONCURRENCY = 100
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".csv", ".xlsx", ".txt"}
 FILE_CATEGORIES = {"invoice", "purchase", "payment", "refund", "other"}
 UPLOAD_CATEGORIES = {"invoice", "purchase"}
@@ -528,26 +528,43 @@ class Store:
         matched_ids = {f.get("matched_invoice_id") for f in credentials if f.get("matched_invoice_id")}
         matched_invoice_total = round(sum(parse_money(f["fields"].get("invoice_amount")) or 0 for f in invoices if f["id"] in matched_ids), 2)
         required_ids = {f["id"] for f in required_invoices}
+        manual_required_ids = {
+            f.get("matched_invoice_id")
+            for f in credentials
+            if f.get("matched_invoice_id") in required_ids and f["fields"].get("match_mode") == "manual"
+        }
+        manual_required_ids.discard(None)
+        check_required_ids = required_ids - manual_required_ids
         required_matched_invoice_total = round(sum(
             parse_money(f["fields"].get("invoice_amount")) or 0
             for f in required_invoices if f["id"] in matched_ids
         ), 2)
+        checked_required_invoice_total = round(sum(
+            parse_money(f["fields"].get("invoice_amount")) or 0
+            for f in required_invoices if f["id"] in check_required_ids
+        ), 2)
         payment_total = round(sum(
             parse_money(f["fields"].get("payment_amount")) or 0
-            for f in credentials if f.get("matched_invoice_id") in required_ids
+            for f in credentials if f.get("matched_invoice_id") in check_required_ids
         ), 2)
         refund_total = round(sum(
             parse_money(f["fields"].get("refund_amount")) or 0
-            for f in credentials if f.get("matched_invoice_id") in required_ids
+            for f in credentials if f.get("matched_invoice_id") in check_required_ids
         ), 2)
         net_total = round(payment_total - refund_total, 2)
-        required_difference = round(required_invoice_total - net_total, 2)
+        required_difference = round(checked_required_invoice_total - net_total, 2)
         return {
             "invoice_total": invoice_total,
             "required_invoice_total": required_invoice_total,
             "no_purchase_invoice_total": no_purchase_invoice_total,
             "matched_invoice_total": matched_invoice_total,
             "required_matched_invoice_total": required_matched_invoice_total,
+            "checked_required_invoice_total": checked_required_invoice_total,
+            "manual_override_invoice_total": round(sum(
+                parse_money(f["fields"].get("invoice_amount")) or 0
+                for f in required_invoices if f["id"] in manual_required_ids
+            ), 2),
+            "manual_override_invoice_count": len(manual_required_ids),
             "payment_total": payment_total,
             "refund_total": refund_total,
             "net_total": net_total,
@@ -687,6 +704,16 @@ class Store:
         fields = dict(file["fields"])
         errors = list(file["errors"])
         status = file["status"]
+        if invoice and file["status"] != "REJECTED":
+            # 拖拽属于明确的人工确认：用户已经确认这份凭证归属于该发票，
+            # 因此凭证默认审核通过，并作为人工覆盖项从自动差额阻断中排除。
+            fields["match_mode"] = "manual"
+            fields["match_confirmed_at"] = now_iso()
+            status = "PASS"
+            errors = []
+        elif not invoice:
+            fields.pop("match_mode", None)
+            fields.pop("match_confirmed_at", None)
         if invoice and file["category"] in {"purchase", "payment"} and self.credential_amount(file) is None:
             invoice_amount = parse_money(invoice["fields"].get("invoice_amount"))
             if invoice_amount is not None:
@@ -694,9 +721,8 @@ class Store:
                 fields["payment_amount_ocr"] = None
                 fields["payment_amount_ocr_raw"] = None
                 fields["payment_amount_source"] = "人工匹配补全（发票金额）"
-                errors = [error for error in errors if "无法识别购买凭证金额" not in error and "无法识别付款金额" not in error]
-                if not errors and status in {"NEEDS_REVIEW", "INCOMPLETE"}:
-                    status = "PASS"
+                errors = []
+                status = "PASS"
         with self.lock:
             self.db.execute("UPDATE files SET matched_invoice_id=?, match_excluded=?, fields_json=?, status=?, errors_json=? WHERE id=?", (invoice_id or None, 0 if invoice_id else 1, json_dumps(fields), status, json_dumps(errors), file_id))
             self.db.commit()
@@ -819,7 +845,20 @@ class Store:
             and requires_purchase_credential(parse_money(f["fields"].get("invoice_amount")), purchase_threshold)
         ]
         qualifying_invoice_ids = {f["id"] for f in qualifying_invoices}
-        qualifying_invoice_total = sum(parse_money(f["fields"].get("invoice_amount")) or 0 for f in qualifying_invoices)
+        manual_invoice_ids = {
+            f.get("matched_invoice_id")
+            for f in refreshed_files
+            if f["category"] in {"purchase", "payment", "refund"}
+            and f["status"] != "REJECTED"
+            and f.get("matched_invoice_id") in qualifying_invoice_ids
+            and f["fields"].get("match_mode") == "manual"
+        }
+        manual_invoice_ids.discard(None)
+        checked_invoice_ids = qualifying_invoice_ids - manual_invoice_ids
+        checked_invoice_total = sum(
+            parse_money(f["fields"].get("invoice_amount")) or 0
+            for f in qualifying_invoices if f["id"] in checked_invoice_ids
+        )
         matched_purchase_invoice_ids = {
             f.get("matched_invoice_id")
             for f in refreshed_files
@@ -835,7 +874,7 @@ class Store:
             f for f in refreshed_files
             if f["category"] in {"purchase", "payment", "refund"}
             and f["status"] != "REJECTED"
-            and f.get("matched_invoice_id") in qualifying_invoice_ids
+            and f.get("matched_invoice_id") in checked_invoice_ids
         ]
         payment_total = sum(
             parse_money(f["fields"].get("payment_amount")) or 0
@@ -845,7 +884,7 @@ class Store:
             parse_money(f["fields"].get("refund_amount")) or 0
             for f in required_credentials
         )
-        if required_credentials and qualifying_invoices and abs((payment_total - refund_total) - qualifying_invoice_total) > float(config["amount_tolerance"]):
+        if required_credentials and checked_invoice_ids and abs((payment_total - refund_total) - checked_invoice_total) > float(config["amount_tolerance"]):
             blocking.append({"status": "NEEDS_REVIEW"})
         has_incomplete = any(item.get("status") == "INCOMPLETE" for item in blocking)
         batch_status = "INCOMPLETE" if has_incomplete else ("NEEDS_REVIEW" if blocking else ("PASS" if total_invoice or not files else "NEEDS_REVIEW"))
@@ -880,6 +919,8 @@ class Store:
                 errors.append("无法识别凭证金额，请人工填写或匹配发票补全")
         with self.lock:
             if payment_amount_changed:
+                fields.pop("match_mode", None)
+                fields.pop("match_confirmed_at", None)
                 self.db.execute("UPDATE files SET fields_json=?, status=?, errors_json=?, review_note=?, matched_invoice_id=NULL, match_excluded=0 WHERE id=?", (json_dumps(fields), status, json_dumps(errors), note, file_id))
             else:
                 self.db.execute("UPDATE files SET fields_json=?, status=?, errors_json=?, review_note=? WHERE id=?", (json_dumps(fields), status, json_dumps(errors), note, file_id))
@@ -987,7 +1028,7 @@ class Store:
                 "退款金额": fields.get("refund_amount"), "订单数量": fields.get("order_count"),
                 "批次有效发票总额": summary.get("invoice_total"), "需购买凭证发票总额": summary.get("required_invoice_total"),
                 "无需购买凭证发票金额": summary.get("no_purchase_invoice_total"), "批次已匹配发票总额": summary.get("matched_invoice_total"),
-                "需凭证发票已匹配金额": summary.get("required_matched_invoice_total"), "批次凭证净额": summary.get("net_total"),
+                "需凭证发票已匹配金额": summary.get("required_matched_invoice_total"), "人工确认覆盖发票金额": summary.get("manual_override_invoice_total"), "批次凭证净额": summary.get("net_total"),
                 "需凭证发票核对差额": summary.get("required_difference"),
                 "处理状态": file["status"], "异常说明": "；".join(file["errors"]), "人工审核备注": file["review_note"], "上传时间": file["created_at"],
             })
@@ -1004,6 +1045,7 @@ class Store:
                 f"无需购买凭证发票金额：{summary.get('no_purchase_invoice_total', 0):.2f}",
                 f"已匹配发票总额：{summary.get('matched_invoice_total', 0):.2f}",
                 f"需凭证发票已匹配金额：{summary.get('required_matched_invoice_total', 0):.2f}",
+                f"人工确认覆盖发票金额：{summary.get('manual_override_invoice_total', 0):.2f}",
                 f"已匹配凭证付款合计：{summary.get('payment_total', 0):.2f}",
                 f"已匹配退款合计：{summary.get('refund_total', 0):.2f}",
                 f"凭证净额：{summary.get('net_total', 0):.2f}",
@@ -1049,6 +1091,7 @@ def create_xlsx(path: Path, headers: list[str], rows: list[dict[str, Any]], summ
             ["无需购买凭证发票金额", summary.get("no_purchase_invoice_total")],
             ["已匹配发票总额", summary.get("matched_invoice_total")],
             ["需凭证发票已匹配金额", summary.get("required_matched_invoice_total")],
+            ["人工确认覆盖发票金额", summary.get("manual_override_invoice_total")],
             ["已匹配凭证付款合计", summary.get("payment_total")],
             ["已匹配退款合计", summary.get("refund_total")],
             ["凭证净额", summary.get("net_total")],
@@ -1124,10 +1167,10 @@ function restoreScrollState(state){if(!state)return;requestAnimationFrame(()=>{f
 function showErrorToast(message){let stack=document.querySelector('.toast-stack');if(!stack){stack=document.createElement('div');stack.className='toast-stack';document.body.appendChild(stack)}const toast=document.createElement('div');toast.className='toast-error';toast.innerHTML=`<div><strong>处理失败</strong><div>${esc(message)}</div></div><button class="toast-close" aria-label="关闭">×</button>`;toast.querySelector('.toast-close').onclick=()=>toast.remove();stack.appendChild(toast);setTimeout(()=>toast.remove(),9000)}
 function renderCredentialUploadProgress(){const host=$('#credentialUploadProgress');if(!host)return;const jobs=Array.from(uploadJobs.values());if(!jobs.length){host.innerHTML='';return}host.innerHTML=`<div class="credential-upload-panel"><div class="credential-upload-title">凭证上传与 DeepSeek 处理进度</div><div class="credential-upload-subtitle">上传完成后进入图片理解；模型不确定时会转人工复核</div>${jobs.map(job=>`<div class="upload-job"><div class="upload-job-name" title="${esc(job.name)}">${esc(job.name)}</div><div class="upload-job-track"><div class="upload-job-fill ${job.indeterminate?'indeterminate':''}" style="width:${job.progress}%"></div></div><div class="upload-job-status ${job.stage==='失败'?'error':job.stage.includes('完成')?'done':''}">${esc(job.stage)} ${job.stage==='上传中'?job.progress+'%':''}</div></div>`).join('')}</div>`}
 function updateUploadJob(id,patch){const old=uploadJobs.get(id)||{};uploadJobs.set(id,{...old,...patch});if(uploadRenderQueued)return;uploadRenderQueued=true;const flush=()=>{uploadRenderQueued=false;renderCredentialUploadProgress()};if(window.requestAnimationFrame)window.requestAnimationFrame(flush);else window.setTimeout(flush,50)}
-async function runUploadTasks(files,category,limit=20){let cursor=0;const workers=Array.from({length:Math.min(limit,files.length)},async()=>{while(true){const index=cursor++;if(index>=files.length)return;const file=files[index];try{await uploadCredentialFile(file,category)}catch(error){showErrorToast(file.name+'：'+error.message)}}});await Promise.all(workers)}
+async function runUploadTasks(files,category,limit=100){let cursor=0;const workers=Array.from({length:Math.min(limit,files.length)},async()=>{while(true){const index=cursor++;if(index>=files.length)return;const file=files[index];try{await uploadCredentialFile(file,category)}catch(error){showErrorToast(file.name+'：'+error.message)}}});await Promise.all(workers)}
 function uploadCredentialFile(file,category){const id=crypto.randomUUID?crypto.randomUUID():`${Date.now()}-${Math.random()}`;updateUploadJob(id,{name:file.name,progress:0,stage:'上传中',indeterminate:false});return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.open('POST','/api/batches/'+current.id+'/upload');xhr.setRequestHeader('X-Defer-Validation','1');xhr.upload.onprogress=event=>{if(event.lengthComputable){const progress=Math.round(event.loaded/event.total);updateUploadJob(id,{progress,stage:progress>=100?'DeepSeek 处理中':'上传中',indeterminate:progress>=100})}};xhr.onerror=()=>{updateUploadJob(id,{stage:'失败',progress:0,indeterminate:false});reject(new Error('上传失败'))};xhr.onload=async()=>{if(xhr.status<200||xhr.status>=300){updateUploadJob(id,{stage:'失败',progress:0,indeterminate:false});try{const error=JSON.parse(xhr.responseText);reject(new Error(error.error||'上传失败'))}catch(e){reject(new Error('上传失败'))}return}try{const result=JSON.parse(xhr.responseText);const method=result.recognition_method||'';const stage=result.duplicate_removed?'重复文件已删除':method.includes('DeepSeek')?'DeepSeek 已完成':method.includes('Vision')?'本地 Vision 已完成':'OCR 已完成';updateUploadJob(id,{progress:100,stage,indeterminate:false});resolve(result)}catch(e){updateUploadJob(id,{stage:'失败',progress:0,indeterminate:false});reject(new Error('服务器返回无效'))}};const fd=new FormData();fd.append('category',category);fd.append('file',file);xhr.send(fd)})}
 function previewButton(file){return `<button class="preview-name" onclick="event.stopPropagation();previewFile('${file.id}')">${esc(file.original_name)}</button>`}
-function credentialLabel(file){const x=file.fields||{};const amount=x.payment_amount??x.order_amount??x.refund_amount;const token=x.order_number||x.transaction_number||'';const source=x.payment_amount_source?`（${esc(x.payment_amount_source)}）`:'';return `<div class="credential-main"><strong>${previewButton(file)}</strong><small>${esc(file.category)}${amount!==undefined&&amount!==null?' · 金额 '+esc(amount)+source:''}${token?' · 订单 '+esc(token):''}</small></div>`}
+function credentialLabel(file){const x=file.fields||{};const amount=x.payment_amount??x.order_amount??x.refund_amount;const token=x.order_number||x.transaction_number||'';const source=x.payment_amount_source?`（${esc(x.payment_amount_source)}）`:'';const manual=x.match_mode==='manual'?' · 人工确认':'';return `<div class="credential-main"><strong>${previewButton(file)}</strong><small>${esc(file.category)}${amount!==undefined&&amount!==null?' · 金额 '+esc(amount)+source:''}${token?' · 订单 '+esc(token):''}${manual}</small></div>`}
 function invoiceLabel(file){const x=file.fields||{};return `<div class="invoice-head"><div><div class="invoice-name">${previewButton(file)}</div><div class="small">发票金额：${esc(x.invoice_amount??'待补录')} · 发票号码：${esc(x.invoice_number??'待补录')}</div></div>${status(file.status)}</div>`}
 function previewFile(id){const file=(current.files||[]).find(item=>item.id===id);if(!file)return;const ext=(file.original_name||'').toLowerCase().split('.').pop();let body='';const url='/api/files/'+id+'/preview';if(ext==='pdf')body=`<iframe src="${url}"></iframe>`;else if(['png','jpg','jpeg','gif','webp'].includes(ext))body=`<img src="${url}" alt="${esc(file.original_name)}">`;else if(['txt','csv'].includes(ext))body=`<iframe src="${url}"></iframe>`;else body=`<div class="preview-text">当前格式不能在页面内预览。<br><br><a href="${url}" target="_blank">打开或下载文件</a></div>`;const modal=document.createElement('div');modal.className='preview-backdrop';modal.innerHTML=`<div class="preview-box"><button class="preview-close" aria-label="关闭">×</button>${body}</div>`;modal.addEventListener('click',event=>{if(event.target===modal||event.target.classList.contains('preview-close'))modal.remove()});document.body.appendChild(modal)}
 function toggleCredentialSelection(id,checked){if(checked)selectedCredentialIds.add(id);else selectedCredentialIds.delete(id);renderMatchPools()}
@@ -1211,7 +1254,7 @@ class Handler(BaseHTTPRequestHandler):
                 "const r=await fetch('/api/batches/'+current.id+'/upload',{method:'POST',body:fd});const d=await r.json();if(!r.ok){alert(d.error||'上传失败')}else if(d.duplicate_removed){alert(d.message||'重复文件已删除')}",
             ).replace(
                 "async function uploadFiles(e){const cat=$('#uploadCategory').value;for(const file of e.target.files){const fd=new FormData();fd.append('category',cat);fd.append('file',file);const r=await fetch('/api/batches/'+current.id+'/upload',{method:'POST',body:fd});if(!r.ok){const d=await r.json();alert(d.error||'上传失败')}}await selectBatch(current.id)}",
-                "async function uploadFiles(e){const cat=$('#uploadCategory').value;const files=Array.from(e.target.files);await runUploadTasks(files,cat,20);await api('/api/batches/'+current.id+'/validate',{method:'POST'});await selectBatch(current.id)}",
+                "async function uploadFiles(e){const cat=$('#uploadCategory').value;const files=Array.from(e.target.files);await runUploadTasks(files,cat,100);await api('/api/batches/'+current.id+'/validate',{method:'POST'});await selectBatch(current.id)}",
             ).replace(
                 "async function selectBatch(id){current=await api('/api/batches/'+id);render();loadBatches()}",
                 "async function selectBatch(id){const scrollState=captureScrollState();current=await api('/api/batches/'+id);render();await loadBatches();restoreScrollState(scrollState)}",
