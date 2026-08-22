@@ -53,7 +53,7 @@ def write_csv(path: Path, results: list[dict[str, Any]]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="DeepSeek Vision 全量付款凭证审核测试")
     parser.add_argument("--sample-dir", type=Path, default=Path("sample/凭证"))
-    parser.add_argument("--workers", type=int, default=20, help="并发请求数，默认 20")
+    parser.add_argument("--workers", type=int, default=100, help="并发请求数，默认 100")
     parser.add_argument("--json-output", type=Path, default=Path("deepseek_receipts_review.json"))
     parser.add_argument("--csv-output", type=Path, default=Path("deepseek_receipts_review.csv"))
     args = parser.parse_args()
