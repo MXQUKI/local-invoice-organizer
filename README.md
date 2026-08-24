@@ -249,16 +249,50 @@ python3 app.py --open-browser
 
 ### macOS DMG
 
-推荐安装 PyInstaller，以生成自包含 app：
+必须先安装 PyInstaller，以生成包含 Python 运行时的自包含 app：
 
 ~~~bash
+python3 -m venv .venv
+source .venv/bin/activate
 python3 -m pip install -r requirements-build.txt
 DEEPSEEK_API_KEY="你的 API Key" ./build_macos.sh
 ~~~
 
 输出：dist/本地发票整理.dmg。
 
-没有 PyInstaller 时会生成调用本机 Python 的包装器，不能保证在另一台没有相同 Python 环境的 Mac 上直接运行。未签名 DMG 首次打开可能显示“无法验证开发者”；正式公开发布建议使用 Apple Developer ID 签名和 notarization。
+#### 更换 API Key 后重新编译
+
+更换 DeepSeek API Key 后，需要重新生成整个 DMG。不要直接修改已有 DMG 或 App 内部文件：
+
+~~~bash
+source .venv/bin/activate
+DEEPSEEK_API_KEY="新的 API Key" ./build_macos.sh
+~~~
+
+构建脚本会把 Key 临时写入 `embedded_config.py`，编译完成后自动删除工作区中的临时文件。新 Key 会进入新的自包含 App，旧 DMG 不会自动更新。
+
+如果要更换模型或 API 地址：
+
+~~~bash
+DEEPSEEK_API_KEY="新的 API Key" \
+DEEPSEEK_MODEL="deepseek-v4-flash-vision-exp" \
+DEEPSEEK_BASE_URL="https://api.deepseek.com" \
+./build_macos.sh
+~~~
+
+如果当前终端没有设置环境变量，但需要复用一个已经生成的嵌入配置文件，可以显式指定：
+
+~~~bash
+EMBEDDED_CONFIG_SOURCE="/path/to/embedded_config.py" ./build_macos.sh
+~~~
+
+不要把 `embedded_config.py`、真实 API Key 或带真实 Key 的 DMG 提交到 Git 或公开发布。
+
+构建脚本会执行应用内置启动测试并进行代码签名验证；测试失败时不会生成 DMG。没有 PyInstaller 时构建会直接停止，避免误生成依赖接收方 Python 环境的不可分发安装包。如仅需本机调试旧式包装器，可以显式设置 `ALLOW_PYTHON_WRAPPER=1`。
+
+应用启动异常会写入 `~/Library/Logs/本地发票整理.log`，并在 macOS 上显示错误弹窗。重复双击时如果 8765 端口已有本程序运行，会直接打开现有页面。
+
+默认使用 ad-hoc 签名，适合本机和内部测试。正式公开发布建议设置 `MACOS_CODESIGN_IDENTITY` 使用 Apple Developer ID，并通过 `MACOS_NOTARY_PROFILE` 启用 notarization；否则从互联网下载后仍可能出现“无法验证开发者”，用户需右键应用选择“打开”。
 
 ### Windows EXE
 

@@ -1,5 +1,38 @@
 #!/bin/zsh
-set -e
 ROOT="$(cd "$(dirname "$0")/../Resources" && pwd)"
 cd "$ROOT"
-exec /usr/bin/env python3 app.py --open-browser
+LOG_DIR="$HOME/Library/Logs"
+LOG_FILE="$LOG_DIR/本地发票整理.log"
+if ! mkdir -p "$LOG_DIR" 2>/dev/null || ! touch "$LOG_FILE" 2>/dev/null; then
+  LOG_FILE="${TMPDIR:-/tmp}/本地发票整理.log"
+fi
+
+export LANG="${LANG:-en_US.UTF-8}"
+export LC_ALL="${LC_ALL:-en_US.UTF-8}"
+export PYTHONUTF8=1
+export PYTHONDONTWRITEBYTECODE=1
+
+PYTHON_BIN=""
+for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+  if [[ -x "$candidate" ]]; then
+    PYTHON_BIN="$candidate"
+    break
+  fi
+done
+
+if [[ -z "$PYTHON_BIN" ]]; then
+  /usr/bin/osascript -e 'tell application "System Events" to display alert "无法启动本地发票整理" message "没有找到 Python 3。请使用自包含 DMG，或先安装 Python 3。" as critical'
+  exit 1
+fi
+
+ARGS=("$@")
+if [[ " ${ARGS[*]} " != *" --check "* && " ${ARGS[*]} " != *" --open-browser "* ]]; then
+  ARGS+=(--open-browser)
+fi
+
+"$PYTHON_BIN" -X utf8 app.py "${ARGS[@]}" >>"$LOG_FILE" 2>&1
+exit_status=$?
+if [[ $exit_status -ne 0 ]]; then
+  /usr/bin/osascript -e 'tell application "System Events" to display alert "无法启动本地发票整理" message "启动失败，请查看 ~/Library/Logs/本地发票整理.log" as critical'
+fi
+exit $exit_status
