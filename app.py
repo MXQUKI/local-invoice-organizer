@@ -595,6 +595,25 @@ class Store:
             batch["summary"] = self.summarize_batch(batch)
             return batch
 
+    def invalidate_archive(self, batch_id: str, status: str = "PROCESSING") -> None:
+        """任何文件变更都会使旧归档包失效。"""
+        with self.lock:
+            row = self.db.execute("SELECT name, archive_path FROM batches WHERE id=?", (batch_id,)).fetchone()
+            if not row:
+                return
+            archive_path = Path(row["archive_path"]) if row["archive_path"] else None
+            self.db.execute("UPDATE batches SET status=?, archive_path=NULL WHERE id=?", (status, batch_id))
+            self.db.commit()
+        archive_dir = ARCHIVE_ROOT / f"{safe_name(row['name'])}_{batch_id}"
+        if archive_dir.exists():
+            shutil.rmtree(archive_dir)
+        if archive_path:
+            try:
+                if archive_path.resolve().parent == ARCHIVE_ROOT.resolve() and archive_path.is_file():
+                    archive_path.unlink()
+            except (OSError, ValueError):
+                pass
+
     def create_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
         batch_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
         config = {
@@ -654,6 +673,7 @@ class Store:
             status = "NEEDS_REVIEW"
             errors.append("无法识别退款金额，请人工填写")
         with self.lock:
+            self.db.execute("UPDATE batches SET status=?, archive_path=NULL WHERE id=?", ("PROCESSING", batch_id))
             self.db.execute(
                 "INSERT INTO files (id,batch_id,original_name,stored_name,category,file_path,sha256,size,recognition_method,fields_json,status,errors_json,review_note,archived_name,created_at,matched_invoice_id,match_excluded) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (file_id, batch_id, original_name, stored_name, category, str(path), digest, len(content), method, json_dumps(fields), status, json_dumps(errors), "", None, now_iso(), None, 0),
@@ -783,6 +803,7 @@ class Store:
         with self.lock:
             self.db.execute("UPDATE files SET matched_invoice_id=?, match_excluded=?, fields_json=?, status=?, errors_json=? WHERE id=?", (invoice_id or None, 0 if invoice_id else 1, json_dumps(fields), status, json_dumps(errors), file_id))
             self.db.commit()
+        self.invalidate_archive(file["batch_id"])
         self.validate(file["batch_id"])
         return self.get_batch(file["batch_id"])  # type: ignore[return-value]
 
@@ -851,7 +872,6 @@ class Store:
             number = (file["fields"].get("invoice_number") or "").strip()
             if number:
                 invoice_numbers[number] = invoice_numbers.get(number, 0) + 1
-        total_invoice = 0.0
         purchase_threshold = float(config["purchase_threshold"])
         purchase_required_error = f"单张发票金额超过{purchase_threshold:.2f}元，需要购买凭证"
         for file in files:
@@ -868,8 +888,6 @@ class Store:
                 amount = parse_money(fields.get("invoice_amount"))
                 if amount is None:
                     status, errors = "NEEDS_REVIEW", errors + ["无法识别发票金额，请人工填写"]
-                else:
-                    total_invoice += amount
                 if fields.get("buyer_name") and normalize_text(fields["buyer_name"]) != normalize_text(config["buyer_name"]):
                     status, errors = "REJECTED", errors + ["购买方名称不一致"]
                 elif not fields.get("buyer_name"):
@@ -926,7 +944,8 @@ class Store:
                 errors = list(dict.fromkeys(file["errors"] + [purchase_required_error]))
                 with self.lock:
                     self.db.execute("UPDATE files SET status=?, errors_json=? WHERE id=?", ("INCOMPLETE", json_dumps(errors), file["id"]))
-        blocking = [f for f in self.get_batch(batch_id)["files"] if f["status"] in STATUS_BLOCKING]  # type: ignore[index]
+        current_files = self.get_batch(batch_id)["files"]  # type: ignore[index]
+        blocking = [f for f in current_files if f["status"] in STATUS_BLOCKING]
         required_credentials = [
             f for f in refreshed_files
             if f["category"] in {"purchase", "payment", "refund"}
@@ -943,8 +962,31 @@ class Store:
         )
         if required_credentials and checked_invoice_ids and abs((payment_total - refund_total) - checked_invoice_total) > float(config["amount_tolerance"]):
             blocking.append({"status": "NEEDS_REVIEW"})
+        current_batch = self.get_batch(batch_id)
+        current_files = current_batch["files"]  # type: ignore[index]
         has_incomplete = any(item.get("status") == "INCOMPLETE" for item in blocking)
-        batch_status = "INCOMPLETE" if has_incomplete else ("NEEDS_REVIEW" if blocking else ("PASS" if total_invoice or not files else "NEEDS_REVIEW"))
+        has_valid_invoice = any(
+            f["category"] == "invoice"
+            and f["status"] != "REJECTED"
+            and parse_money(f["fields"].get("invoice_amount")) is not None
+            for f in current_files
+        )
+        has_rejected = any(f["status"] == "REJECTED" for f in current_files)
+        was_archived = batch["status"] == "ARCHIVED" and bool(batch.get("archive_path"))
+        if has_incomplete:
+            batch_status = "INCOMPLETE"
+        elif blocking:
+            batch_status = "NEEDS_REVIEW"
+        elif was_archived and has_valid_invoice:
+            batch_status = "ARCHIVED"
+        elif has_valid_invoice:
+            batch_status = "REJECTED" if has_rejected else "PASS"
+        elif has_rejected:
+            batch_status = "REJECTED"
+        elif not current_files:
+            batch_status = "PROCESSING"
+        else:
+            batch_status = "NEEDS_REVIEW"
         with self.lock:
             self.db.execute("UPDATE batches SET status=? WHERE id=?", (batch_status, batch_id))
             self.db.commit()
@@ -966,6 +1008,10 @@ class Store:
         status = payload.get("status") or file["status"]
         note = str(payload.get("review_note") or file["review_note"])
         errors = [] if payload.get("status") == "PASS" else list(file["errors"])
+        # 编辑被拒收文件后重新进入核验，避免旧 REJECTED 状态永久跳过校验。
+        if file["status"] == "REJECTED" and "status" not in payload:
+            status = "PROCESSING"
+            errors = []
         if status == "PASS" and file["category"] == "invoice" and not fields.get("invoice_amount"):
             status = "NEEDS_REVIEW"
             errors.append("无法识别发票金额，请人工填写")
@@ -985,13 +1031,14 @@ class Store:
             else:
                 self.db.execute("UPDATE files SET fields_json=?, status=?, errors_json=?, review_note=? WHERE id=?", (json_dumps(fields), status, json_dumps(errors), note, file_id))
             self.db.commit()
+        self.invalidate_archive(file["batch_id"])
         self.auto_match_by_amount(file["batch_id"])
         self.validate(file["batch_id"])
         return self.get_file(file_id)
 
     def archive(self, batch_id: str) -> Path:
         batch = self.validate(batch_id)
-        if batch["status"] not in {"PASS", "REJECTED"}:
+        if batch["status"] not in {"PASS", "REJECTED", "ARCHIVED"}:
             blockers = [
                 f"{file['original_name']}：{file['status']}（{'；'.join(file['errors']) or '状态未完成'}）"
                 for file in batch.get("files", [])

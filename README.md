@@ -106,6 +106,8 @@ python3 app.py --port 8766 --open-browser
 
 重新加载批次数据时，页面会保留工作区、匹配区、文件表格和错误详情的滚动位置。
 
+批次状态会按当前文件重新计算：空批次保持 `PROCESSING`；存在缺材料时为 `INCOMPLETE`；存在待审核或金额差异时为 `NEEDS_REVIEW`；全部文件被拒收时为 `REJECTED`；至少有一张有效发票且没有阻塞问题时为 `PASS`。生成归档包后为 `ARCHIVED`，再次上传、编辑、匹配或删除文件会自动使旧归档包失效并重新核验。
+
 ## 识别流程
 
 ### 发票 PDF
@@ -216,7 +218,7 @@ macOS Vision 源码位于 macos_vision_ocr.swift；构建 DMG 时，build_macos.
 
 | 状态 | 含义 |
 | --- | --- |
-| PROCESSING | 正在识别或处理 |
+| PROCESSING | 正在识别、刚发生文件变更，或空批次等待上传 |
 | PASS | 核验通过，可以归档 |
 | ARCHIVED | 已生成归档包 |
 | REJECTED | 文件被拒收 |
