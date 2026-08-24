@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """Local invoice organizer.
 
 No third-party runtime dependency is required.  The program starts a local
@@ -13,6 +14,7 @@ import argparse
 import base64
 import csv
 import datetime as dt
+import errno
 import hashlib
 import html
 import io
@@ -43,7 +45,7 @@ from xml.etree import ElementTree as ET
 APP_ROOT = Path(__file__).resolve().parent
 if os.environ.get("LOCAL_INVOICE_DATA_DIR"):
     DATA_ROOT = Path(os.environ["LOCAL_INVOICE_DATA_DIR"]).expanduser()
-elif sys.platform == "darwin" and ".app/Contents/Resources" in str(APP_ROOT):
+elif sys.platform == "darwin" and (getattr(sys, "frozen", False) or ".app/Contents" in str(APP_ROOT)):
     DATA_ROOT = Path.home() / "Library" / "Application Support" / "本地发票整理"
 elif getattr(sys, "frozen", False) and os.environ.get("LOCALAPPDATA"):
     DATA_ROOT = Path(os.environ["LOCALAPPDATA"]) / "本地发票整理"
@@ -1489,7 +1491,14 @@ def main() -> None:
     if args.check:
         print(f"OK: Python {os.sys.version.split()[0]}, data={DATA_ROOT}")
         return
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    try:
+        server = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE and args.open_browser:
+            print(f"本地发票整理已经运行：http://{args.host}:{args.port}")
+            webbrowser.open(f"http://{args.host}:{args.port}")
+            return
+        raise
     print(f"本地发票整理已启动：http://{args.host}:{args.port}")
     print(f"数据目录：{DATA_ROOT}")
     if args.open_browser:

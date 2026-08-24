@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """使用本机 Tesseract 识别图片文字。
 
 特点：
