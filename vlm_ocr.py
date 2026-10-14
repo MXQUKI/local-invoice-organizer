@@ -65,8 +65,8 @@ def get_settings() -> dict[str, Any]:
     settings = dict(config.get("vlm") or {})
     settings["enabled"] = bool(settings.get("enabled", False))
     settings["api_key"] = settings.get("api_key") or os.environ.get(str(settings.get("api_key_env", "DEEPSEEK_API_KEY")), "")
-    settings["base_url"] = str(settings.get("base_url", "https://api.deepseek.com/v1")).rstrip("/")
-    settings["model"] = str(settings.get("model", "deepseek-v4-flash-vision-exp"))
+    settings["base_url"] = str(settings.get("base_url", "https://api.deepseek.com")).rstrip("/")
+    settings["model"] = str(settings.get("model", "deepseek-flash"))
     settings["timeout_seconds"] = int(settings.get("timeout_seconds", 90))
     return settings
 

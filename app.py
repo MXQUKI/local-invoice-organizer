@@ -16,6 +16,7 @@ import csv
 import datetime as dt
 import errno
 import hashlib
+import hmac
 import html
 import io
 import itertools
@@ -40,6 +41,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
+
+from invoice_text import embedded_page_text, invoice_fields_from_text
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -114,6 +117,37 @@ def is_purchase_requirement_error(error: str) -> bool:
     return text.startswith("单张发票金额") and text.endswith("需要购买凭证")
 
 
+def is_duplicate_invoice_error(error: str) -> bool:
+    return error == "重复发票号码" or error.startswith("重复发票号码：")
+
+
+def duplicate_invoice_peers(files: list[dict[str, Any]]) -> dict[str, list[dict[str, str]]]:
+    """按同一批次的发票号码列出关联文件，包括已因重复而拒收的文件。"""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for file in files:
+        number = str(file["fields"].get("invoice_number") or "").strip()
+        if file["category"] == "invoice" and number:
+            groups.setdefault(number, []).append(file)
+    peers: dict[str, list[dict[str, str]]] = {}
+    for number, group in groups.items():
+        if len(group) < 2:
+            continue
+        names = [file["original_name"] for file in group]
+        references = [
+            {
+                "id": file["id"],
+                "original_name": file["original_name"],
+                "invoice_number": number,
+                "label": (f"{file['original_name']}（ID {file['id'][:8]}）"
+                          if names.count(file["original_name"]) > 1 else file["original_name"]),
+            }
+            for file in group
+        ]
+        for file in group:
+            peers[file["id"]] = [ref for ref in references if ref["id"] != file["id"]]
+    return peers
+
+
 def money_text(value: Any) -> str:
     number = parse_money(value)
     return "" if number is None else f"{number:.2f}"
@@ -139,14 +173,18 @@ def read_text_from_pdf(path: Path) -> str:
     try:
         from pypdf import PdfReader  # type: ignore
 
-        return "\n".join((page.extract_text() or "") for page in PdfReader(str(path)).pages)
+        text = "\f".join(embedded_page_text(page) for page in PdfReader(str(path)).pages)
+        if text.strip():
+            return text
     except Exception:
         pass
     try:
         import pdfplumber  # type: ignore
 
         with pdfplumber.open(str(path)) as pdf:
-            return "\n".join((page.extract_text() or "") for page in pdf.pages)
+            text = "\f".join((page.extract_text(layout=True) or "") for page in pdf.pages)
+            if text.strip():
+                return text
     except Exception:
         pass
     candidates = [
@@ -372,6 +410,9 @@ def extract_fields(path: Path, category: str) -> tuple[dict[str, Any], str]:
     }
     if not text and not deepseek_fields:
         return fields, method
+    if category == "invoice" and method == "PDF内嵌文字提取":
+        fields.update(invoice_fields_from_text(text))
+        return fields, method
     fields["buyer_name"] = first_match(text, [
         r"购买方(?:名称)?\s*[:：]\s*(.+)",
         r"购\s*名称\s*[:：]\s*(.+?)(?:\s{2,}销|\s+销\s*名称|$)",
@@ -592,6 +633,9 @@ class Store:
                 return None
             batch = self._batch(row)
             batch["files"] = [self._file(f) for f in self.db.execute("SELECT * FROM files WHERE batch_id=? ORDER BY created_at", (batch_id,))]
+            duplicate_peers = duplicate_invoice_peers(batch["files"])
+            for file in batch["files"]:
+                file["duplicate_invoices"] = duplicate_peers.get(file["id"], [])
             batch["summary"] = self.summarize_batch(batch)
             return batch
 
@@ -653,7 +697,7 @@ class Store:
                 existing = self.db.execute("SELECT * FROM files WHERE id=?", (duplicate["id"],)).fetchone()
                 result = self._file(existing) if existing else {"id": duplicate["id"], "batch_id": batch_id}
                 result["duplicate_removed"] = True
-                result["message"] = "重复文件已直接删除，保留首次上传文件"
+                result["message"] = f"重复文件“{original_name}”已删除，已保留“{result.get('original_name', original_name)}”（ID {duplicate['id'][:8]}）"
                 return result
         fields, method = extract_fields(path, category)
         status = "PASS" if category != "invoice" and method not in {"待OCR/人工录入", "人工录入"} else ("NEEDS_REVIEW" if category == "invoice" else "PASS")
@@ -865,22 +909,29 @@ class Store:
         batch = self.get_batch(batch_id)
         config = batch["config"]
         files = batch["files"]
-        invoice_numbers: dict[str, int] = {}
-        for file in files:
-            if file["category"] != "invoice" or file["status"] == "REJECTED":
-                continue
-            number = (file["fields"].get("invoice_number") or "").strip()
-            if number:
-                invoice_numbers[number] = invoice_numbers.get(number, 0) + 1
         purchase_threshold = float(config["purchase_threshold"])
         purchase_required_error = f"单张发票金额超过{purchase_threshold:.2f}元，需要购买凭证"
         for file in files:
+            previous_duplicate = any(is_duplicate_invoice_error(e) for e in file["errors"])
+            remaining_errors = [e for e in file["errors"] if not is_duplicate_invoice_error(e)]
+            peers = file["duplicate_invoices"]
+            duplicate_error = (
+                f"重复发票号码：{peers[0]['invoice_number']}，与“"
+                + "”、“".join(peer["label"] for peer in peers) + "”重复"
+                if peers else None
+            )
+            # 旧版本只存通用错误；重新核验时更新文件名，或在重复解除后恢复核验。
+            if file["status"] == "REJECTED" and previous_duplicate and not remaining_errors:
+                file["status"] = "NEEDS_REVIEW"
             if file["status"] == "REJECTED":
+                errors = remaining_errors + ([duplicate_error] if duplicate_error else [])
+                with self.lock:
+                    self.db.execute("UPDATE files SET errors_json=? WHERE id=?", (json_dumps(errors), file["id"]))
                 continue
             fields = file["fields"]
             errors = [
-                e for e in file["errors"]
-                if e not in {"购买方名称不一致", "购买方税号不一致", "开票日期不是允许年份", "重复发票号码"}
+                e for e in remaining_errors
+                if e not in {"购买方名称不一致", "购买方税号不一致", "开票日期不是允许年份", "无法识别发票号码，请人工填写"}
                 and not is_purchase_requirement_error(e)
             ]
             status = file["status"]
@@ -888,6 +939,8 @@ class Store:
                 amount = parse_money(fields.get("invoice_amount"))
                 if amount is None:
                     status, errors = "NEEDS_REVIEW", errors + ["无法识别发票金额，请人工填写"]
+                if not str(fields.get("invoice_number") or "").strip():
+                    status, errors = "NEEDS_REVIEW", errors + ["无法识别发票号码，请人工填写"]
                 if fields.get("buyer_name") and normalize_text(fields["buyer_name"]) != normalize_text(config["buyer_name"]):
                     status, errors = "REJECTED", errors + ["购买方名称不一致"]
                 elif not fields.get("buyer_name"):
@@ -901,10 +954,10 @@ class Store:
                     status, errors = "REJECTED", errors + ["开票日期不是允许年份"]
                 elif not date_value:
                     status, errors = "NEEDS_REVIEW", errors + ["无法确认开票日期"]
-                if fields.get("invoice_number") and invoice_numbers.get(fields["invoice_number"], 0) > 1:
-                    status, errors = "REJECTED", errors + ["重复发票号码"]
                 if int(fields.get("order_count") or 0) > 1:
                     status, errors = "MULTI_ORDER_REVIEW", errors + ["一张发票对应多个订单，需要人工确认"]
+                if duplicate_error:
+                    status, errors = "REJECTED", errors + [duplicate_error]
                 if not errors and status != "MULTI_ORDER_REVIEW":
                     status = "PASS"
             errors = list(dict.fromkeys(errors))
@@ -1240,6 +1293,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .shell{max-width:1520px;padding:20px 24px}
 .top{position:relative;z-index:2;padding:2px 0 16px}
 .top h1{letter-spacing:-.02em}
+.app-actions{display:flex;flex-direction:column;align-items:flex-end;gap:7px;max-width:300px;text-align:right}.exit-status{font-size:12px;color:#64748b;line-height:1.5}.grid[inert]{opacity:.55}.exit-button{white-space:nowrap}
 .grid{align-items:start;grid-template-columns:300px minmax(0,1fr);gap:16px}
 .grid>aside{position:sticky;top:14px;max-height:calc(100vh - 28px);overflow-y:auto;overscroll-behavior:contain;padding-right:3px}
 .card{border-color:#dbe3ee;box-shadow:0 8px 28px #1e293b0b}
@@ -1265,6 +1319,17 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 """
 
 
+EXIT_JS = r"""
+const EXIT_TOKEN='__EXIT_TOKEN__';
+let exitInProgress=false;
+let busyOperations=0;
+function updateExitButton(){const button=$('#exitProgram');if(!button)return;button.disabled=exitInProgress||busyOperations>0;button.textContent=exitInProgress?'正在退出…':'退出程序';button.title=busyOperations>0?'请等待上传、识别或保存完成后再退出':'停止本地服务并退出程序';const note=$('#exitStatus');if(note&&!exitInProgress)note.textContent=busyOperations>0?'正在处理，完成后可退出':''}
+function beginWork(){if(exitInProgress)throw Error('程序正在退出，请稍后重新打开');busyOperations++;updateExitButton();return()=>{busyOperations--;updateExitButton()}}
+async function waitForProgramExit(instanceId){const note=$('#exitStatus');for(let attempt=0;attempt<60;attempt++){await new Promise(resolve=>setTimeout(resolve,250));const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),1000);let response;try{response=await fetch('/api/lifecycle',{cache:'no-store',signal:controller.signal})}catch(error){if(error.name==='AbortError')continue;note.textContent='程序已退出，可以关闭此页面。';$('#exitProgram').textContent='已退出';return}finally{clearTimeout(timer)}try{const state=await response.json();if(state.instance_id!==instanceId){note.textContent='本次程序已退出，另一个实例已启动。请刷新页面。';$('#exitProgram').textContent='已退出';return}}catch(error){}}note.textContent='退出尚未完成，请稍后点击检查状态。';const button=$('#exitProgram');button.disabled=false;button.textContent='检查退出状态';button.onclick=()=>{button.disabled=true;waitForProgramExit(instanceId)}}
+async function exitProgram(){if(exitInProgress)return;if(busyOperations){showErrorToast('请等待上传、识别或保存完成后再退出');return}if(!confirm('确定退出程序？未保存的修改将不会保留，已保存的批次和文件会保留。'))return;exitInProgress=true;updateExitButton();const grid=$('.grid');grid.inert=true;$('#exitStatus').textContent='正在停止本地服务…';let result;try{const response=await fetch('/api/shutdown',{method:'POST',headers:{'X-Exit-Token':EXIT_TOKEN}});result=await response.json();if(!response.ok)throw Error(result.error||'退出失败')}catch(error){exitInProgress=false;grid.inert=false;updateExitButton();showErrorToast(error.message||'退出失败，请重试');return}await waitForProgramExit(result.instance_id)}
+"""
+
+
 MATCH_JS = r"""
 let selectedCredentialIds=new Set();
 const uploadJobs=new Map();
@@ -1278,7 +1343,7 @@ async function runUploadTasks(files,category,limit=100){let cursor=0;const worke
 function uploadCredentialFile(file,category){const id=crypto.randomUUID?crypto.randomUUID():`${Date.now()}-${Math.random()}`;updateUploadJob(id,{name:file.name,progress:0,stage:'上传中',indeterminate:false});return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.open('POST','/api/batches/'+current.id+'/upload');xhr.setRequestHeader('X-Defer-Validation','1');xhr.upload.onprogress=event=>{if(event.lengthComputable){const progress=Math.round(event.loaded/event.total);updateUploadJob(id,{progress,stage:progress>=100?'DeepSeek 处理中':'上传中',indeterminate:progress>=100})}};xhr.onerror=()=>{updateUploadJob(id,{stage:'失败',progress:0,indeterminate:false});reject(new Error('上传失败'))};xhr.onload=async()=>{if(xhr.status<200||xhr.status>=300){updateUploadJob(id,{stage:'失败',progress:0,indeterminate:false});try{const error=JSON.parse(xhr.responseText);reject(new Error(error.error||'上传失败'))}catch(e){reject(new Error('上传失败'))}return}try{const result=JSON.parse(xhr.responseText);const method=result.recognition_method||'';const stage=result.duplicate_removed?'重复文件已删除':method.includes('DeepSeek')?'DeepSeek 已完成':method.includes('Vision')?'本地 Vision 已完成':'OCR 已完成';updateUploadJob(id,{progress:100,stage,indeterminate:false});resolve(result)}catch(e){updateUploadJob(id,{stage:'失败',progress:0,indeterminate:false});reject(new Error('服务器返回无效'))}};const fd=new FormData();fd.append('category',category);fd.append('file',file);xhr.send(fd)})}
 function previewButton(file){return `<button class="preview-name" onclick="event.stopPropagation();previewFile('${file.id}')">${esc(file.original_name)}</button>`}
 function credentialLabel(file){const x=file.fields||{};const amount=x.payment_amount??x.order_amount??x.refund_amount;const token=x.order_number||x.transaction_number||'';const source=x.payment_amount_source?`（${esc(x.payment_amount_source)}）`:'';const manual=x.match_mode==='manual'?' · 人工确认':'';return `<div class="credential-main"><strong>${previewButton(file)}</strong><small>${esc(file.category)}${amount!==undefined&&amount!==null?' · 金额 '+esc(amount)+source:''}${token?' · 订单 '+esc(token):''}${manual}</small></div>`}
-function invoiceLabel(file){const x=file.fields||{};return `<div class="invoice-head"><div><div class="invoice-name">${previewButton(file)}</div><div class="small">发票金额：${esc(x.invoice_amount??'待补录')} · 发票号码：${esc(x.invoice_number??'待补录')}</div></div>${status(file.status)}</div>`}
+function invoiceLabel(file){const x=file.fields||{};return `<div class="invoice-head"><div><div class="invoice-name">${previewButton(file)}</div><div class="small">发票金额：${esc(x.invoice_amount??'待补录')} · 发票号码：${esc(x.invoice_number??'待补录')}</div></div>${status(file.status)}</div>${file.duplicate_invoices?.length?renderErrorSummary(file.errors,file.duplicate_invoices):''}`}
 function previewFile(id){const file=(current.files||[]).find(item=>item.id===id);if(!file)return;const ext=(file.original_name||'').toLowerCase().split('.').pop();let body='';const url='/api/files/'+id+'/preview';if(ext==='pdf')body=`<iframe src="${url}"></iframe>`;else if(['png','jpg','jpeg','gif','webp'].includes(ext))body=`<img src="${url}" alt="${esc(file.original_name)}">`;else if(['txt','csv'].includes(ext))body=`<iframe src="${url}"></iframe>`;else body=`<div class="preview-text">当前格式不能在页面内预览。<br><br><a href="${url}" target="_blank">打开或下载文件</a></div>`;const modal=document.createElement('div');modal.className='preview-backdrop';modal.innerHTML=`<div class="preview-box"><button class="preview-close" aria-label="关闭">×</button>${body}</div>`;modal.addEventListener('click',event=>{if(event.target===modal||event.target.classList.contains('preview-close'))modal.remove()});document.body.appendChild(modal)}
 function toggleCredentialSelection(id,checked){const scrollState=captureScrollState();if(checked)selectedCredentialIds.add(id);else selectedCredentialIds.delete(id);renderMatchPools();restoreScrollState(scrollState)}
 function dragCredential(event,id){const ids=selectedCredentialIds.has(id)?Array.from(selectedCredentialIds):[id];event.dataTransfer.setData('application/x-invoice-credentials',JSON.stringify(ids));event.dataTransfer.setData('text/plain',ids.join(','));event.dataTransfer.effectAllowed='move'}
@@ -1292,9 +1357,19 @@ async function deleteFile(id){const file=(current.files||[]).find(item=>item.id=
 function renderProgress(){const host=$('#progressPanel');if(!host||!current)return;const files=current.files||[];const total=files.length;const processed=files.filter(f=>f.status!=='PROCESSING').length;const reviewed=files.filter(f=>['PASS','REJECTED','ARCHIVED'].includes(f.status)).length;const credentials=files.filter(f=>f.category!=='invoice');const matched=credentials.filter(f=>f.matched_invoice_id).length;const percent=total?Math.round(reviewed/total*100):0;const reviewText=files.filter(f=>['NEEDS_REVIEW','MULTI_ORDER_REVIEW'].includes(f.status)).length;const incomplete=files.filter(f=>f.status==='INCOMPLETE').length;host.innerHTML=`<div class="progress-panel"><div class="progress-head"><div><div class="progress-title">归档准备度</div><div class="small">${current.status==='ARCHIVED'?'归档包已生成':current.status==='PASS'?'材料已核验，可以生成归档包':'完成识别、审核和必要的凭证匹配后才能归档'}</div></div><div class="progress-percent">${percent}%</div></div><div class="progress-track"><div class="progress-fill" style="width:${percent}%"></div></div><div class="progress-stats"><span>识别完成 ${processed}/${total}</span><span>审核通过/拒收 ${reviewed}/${total}</span><span>待审核 ${reviewText}</span><span>缺材料 ${incomplete}</span><span>凭证匹配 ${matched}/${credentials.length}</span></div></div>`}
 function renderAmountSummary(){const host=$('#amountSummary');if(!host||!current)return;const s=current.summary||{};const money=v=>Number(v||0).toFixed(2);const difference=Number(s.required_difference??s.difference??0);host.innerHTML=`<div class="amount-summary"><div class="amount-summary-title">核对后金额</div><div class="amount-summary-grid"><div><span>有效发票总额</span><strong>¥${money(s.invoice_total)}</strong></div><div><span>需购买凭证发票</span><strong>¥${money(s.required_invoice_total)}</strong></div><div><span>无需购买凭证发票</span><strong>¥${money(s.no_purchase_invoice_total)}</strong></div><div><span>凭证净额（仅需凭证发票）</span><strong>¥${money(s.net_total)}</strong></div><div class="${Math.abs(difference)<0.01?'amount-ok':'amount-warn'}"><span>需凭证发票核对差额</span><strong>¥${money(difference)}</strong></div></div><div class="small">发票匹配 ${s.matched_invoice_count||0}/${s.invoice_count||0} · 凭证匹配 ${s.matched_credential_count||0}/${s.credential_count||0}</div></div>`}
 function renderBatchBlockers(){const host=$('#progressPanel');if(!host||!current||current.status==='PASS'||current.status==='ARCHIVED')return;const files=current.files||[];const reasons=[];const threshold=Number(current.config.purchase_threshold||150);files.filter(f=>f.category==='invoice'&&f.status!=='REJECTED'&&Number(f.fields?.invoice_amount||0)>threshold).forEach(inv=>{if(!files.some(c=>c.category==='purchase'&&c.matched_invoice_id===inv.id))reasons.push(`高额发票 ${inv.original_name} 尚未匹配购买凭证`)});files.filter(f=>['NEEDS_REVIEW','MULTI_ORDER_REVIEW','INCOMPLETE'].includes(f.status)).slice(0,5).forEach(f=>reasons.push(`${f.original_name}：${(f.errors||[]).join('；')||f.status}`));const unique=[...new Set(reasons)];if(unique.length){const box=document.createElement('div');box.className='error';box.style.margin='-4px 0 12px';box.innerHTML='<strong>当前不能归档的原因：</strong><br>'+unique.map(x=>esc(x)).join('<br>');host.appendChild(box)}}
-function renderMatchPools(){const host=$('#matchPools');if(!host||!current)return;const files=current.files||[];const invoices=files.filter(f=>f.category==='invoice');const credentials=files.filter(f=>f.category!=='invoice');const matchedInvoices=invoices.filter(inv=>credentials.some(c=>c.matched_invoice_id===inv.id));const unmatchedInvoices=invoices.filter(inv=>!credentials.some(c=>c.matched_invoice_id===inv.id));const unmatchedCredentials=credentials.filter(c=>!c.matched_invoice_id);selectedCredentialIds=new Set(Array.from(selectedCredentialIds).filter(id=>unmatchedCredentials.some(c=>c.id===id)));const invoiceCard=(inv,matched)=>{const cs=credentials.filter(c=>c.matched_invoice_id===inv.id);return `<div class="invoice-card ${matched?'':'drop-target'}" ${matched?'':'ondragover="dragOverInvoice(event)" ondragleave="dragLeaveInvoice(event)" ondrop="dropCredential(event,\''+inv.id+'\')"'}>${invoiceLabel(inv)}${matched?`<div class="match-hint">已匹配 ${cs.length} 份凭证</div>${cs.map(c=>`<div class="credential-chip">${credentialLabel(c)}<button class="unlink" onclick="unmatchCredential('${c.id}')">移出</button></div>`).join('')}`:'<div class="match-hint">将右侧待匹配凭证拖到此处</div>'}</div>`};const pendingHtml=unmatchedInvoices.length?unmatchedInvoices.map(inv=>invoiceCard(inv,false)).join(''):'<div class="empty-match">所有发票均已匹配或无需匹配</div>';const matchedHtml=matchedInvoices.length?matchedInvoices.map(inv=>invoiceCard(inv,true)).join(''):'<div class="empty-match">暂无已匹配发票</div>';const credentialHtml=unmatchedCredentials.length?unmatchedCredentials.map(c=>`<div class="credential-chip ${selectedCredentialIds.has(c.id)?'selected':''}" draggable="true" ondragstart="dragCredential(event,'${c.id}')"><input class="credential-check" type="checkbox" ${selectedCredentialIds.has(c.id)?'checked':''} onclick="event.stopPropagation();toggleCredentialSelection('${c.id}',this.checked)"><div class="credential-main">${credentialLabel(c)}</div></div>`).join(''):'<div class="empty-match">暂无待匹配凭证</div>';host.innerHTML=`<div class="match-workbench"><section class="match-board"><h3>发票匹配工作区</h3><p class="match-subtitle">每张发票只在这里出现一次；已匹配凭证会显示在发票下方</p><div class="invoice-columns"><div class="invoice-column"><div class="column-title"><span>待匹配发票</span><span class="column-count">${unmatchedInvoices.length}</span></div>${pendingHtml}</div><div class="invoice-column"><div class="column-title"><span>已匹配发票</span><span class="column-count">${matchedInvoices.length}</span></div>${matchedHtml}</div></div></section><aside class="credential-dock"><h3>待匹配凭证 <span class="column-count">${unmatchedCredentials.length}</span></h3><p class="match-subtitle">可勾选多份凭证，再拖动任意一份到发票卡片</p><p class="selection-hint">已选择 ${selectedCredentialIds.size} 份</p><div class="dock-hint">高额发票必须至少匹配一份购买凭证</div>${credentialHtml}</aside></div>`}
+function renderMatchPools(){
+    const host=$('#matchPools');
+    if(!host||!current)return;
+    const files=current.files||[];
+    const threshold=Number(current.config.purchase_threshold??150);
+    const invoices=files.filter(file=>{
+        if(file.category!=='invoice')return false;
+        const amount=file.fields?.invoice_amount;
+        return amount!==null&&amount!==undefined&&String(amount).trim()!==''&&Number.isFinite(Number(amount))&&Number(amount)>threshold;
+    });
+    const credentials=files.filter(f=>f.category!=='invoice');const matchedInvoices=invoices.filter(inv=>credentials.some(c=>c.matched_invoice_id===inv.id));const unmatchedInvoices=invoices.filter(inv=>!credentials.some(c=>c.matched_invoice_id===inv.id));const unmatchedCredentials=credentials.filter(c=>!c.matched_invoice_id);selectedCredentialIds=new Set(Array.from(selectedCredentialIds).filter(id=>unmatchedCredentials.some(c=>c.id===id)));const invoiceCard=(inv,matched)=>{const cs=credentials.filter(c=>c.matched_invoice_id===inv.id);return `<div class="invoice-card ${matched?'':'drop-target'}" ${matched?'':'ondragover="dragOverInvoice(event)" ondragleave="dragLeaveInvoice(event)" ondrop="dropCredential(event,\''+inv.id+'\')"'}>${invoiceLabel(inv)}${matched?`<div class="match-hint">已匹配 ${cs.length} 份凭证</div>${cs.map(c=>`<div class="credential-chip">${credentialLabel(c)}<button class="unlink" onclick="unmatchCredential('${c.id}')">移出</button></div>`).join('')}`:'<div class="match-hint">将右侧待匹配凭证拖到此处</div>'}</div>`};const pendingHtml=unmatchedInvoices.length?unmatchedInvoices.map(inv=>invoiceCard(inv,false)).join(''):'<div class="empty-match">暂无待匹配的高额发票</div>';const matchedHtml=matchedInvoices.length?matchedInvoices.map(inv=>invoiceCard(inv,true)).join(''):'<div class="empty-match">暂无已匹配发票</div>';const credentialHtml=unmatchedCredentials.length?unmatchedCredentials.map(c=>`<div class="credential-chip ${selectedCredentialIds.has(c.id)?'selected':''}" draggable="true" ondragstart="dragCredential(event,'${c.id}')"><input class="credential-check" type="checkbox" ${selectedCredentialIds.has(c.id)?'checked':''} onclick="event.stopPropagation();toggleCredentialSelection('${c.id}',this.checked)"><div class="credential-main">${credentialLabel(c)}</div></div>`).join(''):'<div class="empty-match">暂无待匹配凭证</div>';host.innerHTML=`<div class="match-workbench"><section class="match-board"><h3>发票匹配工作区</h3><p class="match-subtitle">仅显示单张金额超过 ${esc(threshold.toFixed(2))} 元的发票；其余发票请在下方文件表格查看</p><div class="invoice-columns"><div class="invoice-column"><div class="column-title"><span>待匹配发票</span><span class="column-count">${unmatchedInvoices.length}</span></div>${pendingHtml}</div><div class="invoice-column"><div class="column-title"><span>已匹配发票</span><span class="column-count">${matchedInvoices.length}</span></div>${matchedHtml}</div></div></section><aside class="credential-dock"><h3>待匹配凭证 <span class="column-count">${unmatchedCredentials.length}</span></h3><p class="match-subtitle">可勾选多份凭证，再拖动任意一份到发票卡片</p><p class="selection-hint">已选择 ${selectedCredentialIds.size} 份</p><div class="dock-hint">高额发票必须至少匹配一份购买凭证</div>${credentialHtml}</aside></div>`}
 
-function renderErrorSummary(errors){const items=Array.from(new Set((errors||[]).filter(Boolean).map(String)));if(!items.length)return '';const preview=items[0];return `<details class="error-details"><summary><span class="error-label">需处理</span><span class="error-count">${items.length}项</span><span class="error-preview" title="${esc(preview)}">${esc(preview)}</span></summary><div class="error-list">${items.map(item=>`<div>${esc(item)}</div>`).join('')}</div></details>`}
+function renderErrorSummary(errors,duplicates=[]){const items=Array.from(new Set((errors||[]).filter(Boolean).map(String)));if(!items.length&&!duplicates.length)return '';const preview=duplicates.length?`与 ${duplicates.map(file=>file.label).join('、')} 重复`:items[0];return `<details class="error-details"><summary><span class="error-label">${duplicates.length?'重复发票':'需处理'}</span><span class="error-count">${duplicates.length||items.length}${duplicates.length?'张':'项'}</span><span class="error-preview" title="${esc(preview)}">${esc(preview)}</span></summary><div class="error-list">${items.map(item=>`<div>${esc(item)}</div>`).join('')}${duplicates.length?'<div>点击查看重复的发票：</div>':''}${duplicates.map(file=>`<div>${previewButton({...file,original_name:file.label})}</div>`).join('')}</div></details>`}
 function renderErrorPanel(title,items){const values=Array.from(new Set((items||[]).filter(Boolean).map(String)));if(!values.length)return '';return `<div class="batch-error-panel"><div class="batch-error-icon">!</div><div class="batch-error-content"><div class="batch-error-title">${esc(title)} <span class="error-count">${values.length}项</span></div><details class="error-details"><summary>展开查看具体问题</summary><div class="error-list">${values.map(item=>`<div>${esc(item)}</div>`).join('')}</div></details></div></div>`}
 function renderBatchBlockers(){const host=$('#progressPanel');if(!host||!current||current.status==='PASS'||current.status==='ARCHIVED')return;const files=current.files||[];const reasons=[];const threshold=Number(current.config.purchase_threshold||150);files.filter(f=>f.category==='invoice'&&f.status!=='REJECTED'&&Number(f.fields?.invoice_amount||0)>threshold).forEach(inv=>{if(!files.some(c=>c.category==='purchase'&&c.matched_invoice_id===inv.id))reasons.push(`高额发票 ${inv.original_name} 尚未匹配购买凭证`)});files.filter(f=>['NEEDS_REVIEW','MULTI_ORDER_REVIEW','INCOMPLETE'].includes(f.status)).forEach(f=>{const errors=f.errors&&f.errors.length?f.errors:[f.status];reasons.push(`${f.original_name}：${errors.join('；')}`)});const unique=[...new Set(reasons)];if(unique.length)host.insertAdjacentHTML('beforeend',renderErrorPanel('当前不能归档',unique))}
 """
@@ -1308,11 +1383,11 @@ HTML = r"""<!doctype html>
 const $=s=>document.querySelector(s); let current=null;
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const status=s=>`<span class="pill ${esc(s)}">${esc(s)}</span>`;
-async function api(url,opt={}){const r=await fetch(url,{...opt,headers:{'Content-Type':'application/json',...(opt.headers||{})}});const d=await r.json();if(!r.ok)throw Error(d.error||'请求失败');return d}
+async function api(url,opt={}){const finish=beginWork();try{const r=await fetch(url,{...opt,headers:{'Content-Type':'application/json',...(opt.headers||{})}});const d=await r.json();if(!r.ok)throw Error(d.error||'请求失败');return d}finally{finish()}}
 async function loadBatches(){const bs=await api('/api/batches');$('#batchList').innerHTML=bs.length?bs.map(b=>`<div class="batch ${current&&current.id===b.id?'active':''}" onclick="selectBatch('${b.id}')"><div class="batch-title">${esc(b.name)}</div><div class="meta">${esc(b.created_at)} · ${status(b.status)}</div></div>`).join(''):'<div class="empty">还没有批次</div>';}
 async function selectBatch(id){current=await api('/api/batches/'+id);render();loadBatches()}
 function render(){if(!current)return; const f=current.files||[]; let rows=f.map(file=>{const x=file.fields||{};return `<tr><td>${esc(file.original_name)}<div class="small">${esc(file.category)} · ${esc(file.recognition_method)}</div></td><td>${status(file.status)}<div class="error">${esc((file.errors||[]).join('；'))}</div></td><td><input data-id="${file.id}" data-k="invoice_amount" value="${esc(x.invoice_amount??'')}" placeholder="金额"><input data-id="${file.id}" data-k="invoice_number" value="${esc(x.invoice_number??'')}" placeholder="发票号码"><input data-id="${file.id}" data-k="invoice_date" value="${esc(x.invoice_date??'')}" placeholder="日期"><input data-id="${file.id}" data-k="buyer_name" value="${esc(x.buyer_name??'')}" placeholder="购买方名称"><input data-id="${file.id}" data-k="buyer_tax_id" value="${esc(x.buyer_tax_id??'')}" placeholder="购买方税号"></td><td><input data-id="${file.id}" data-k="payment_amount" value="${esc(x.payment_amount??'')}" placeholder="付款金额"><input data-id="${file.id}" data-k="order_amount" value="${esc(x.order_amount??'')}" placeholder="订单金额"><input data-id="${file.id}" data-k="refund_amount" value="${esc(x.refund_amount??'')}" placeholder="退款金额"></td><td><select data-id="${file.id}" data-k="category"><option value="invoice" ${file.category==='invoice'?'selected':''}>发票</option><option value="purchase" ${file.category==='purchase'?'selected':''}>购买凭证</option><option value="payment" ${file.category==='payment'?'selected':''}>付款凭证</option><option value="refund" ${file.category==='refund'?'selected':''}>退款凭证</option><option value="other" ${file.category==='other'?'selected':''}>其他材料</option></select><textarea data-id="${file.id}" data-k="review_note" placeholder="审核备注">${esc(file.review_note)}</textarea><button class="btn secondary" onclick="saveFile('${file.id}')">保存</button><button class="btn" onclick="passFile('${file.id}')">通过</button></td></tr>`}).join(''); $('#workspace').innerHTML=`<div class="toolbar"><div><h2 style="display:inline;margin-right:10px">${esc(current.name)}</h2>${status(current.status)}</div><button class="btn secondary" onclick="validateBatch()">重新核验</button><button class="btn" onclick="archiveBatch()" ${current.status==='PASS'||current.status==='REJECTED'?'':'disabled'}>生成 ZIP</button>${current.archive_path?`<a class="btn" href="/download/${current.id}">下载归档包</a>`:''}</div><div class="small" style="margin-bottom:12px">购买方：${esc(current.config.buyer_name)} · 税号：${esc(current.config.buyer_tax_id)} · 年份：${esc(current.config.allowed_year)} · ≥${esc(current.config.purchase_threshold)} 元需购买凭证</div><div class="drop">选择文件后上传到当前批次。请分别选择类别，可重复上传。<br><select id="uploadCategory"><option value="invoice">发票</option><option value="purchase">购买凭证</option><option value="payment">付款凭证</option><option value="refund">退款凭证</option><option value="other">其他材料</option></select><input id="uploadInput" type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.csv,.xlsx,.txt"></div><div style="overflow:auto;margin-top:15px"><table class="files"><thead><tr><th>文件</th><th>状态</th><th>发票字段</th><th>凭证字段</th><th>分类 / 操作</th></tr></thead><tbody>${rows||'<tr><td colspan="5" class="empty">请上传文件</td></tr>'}</tbody></table></div>`; $('#uploadInput').addEventListener('change',uploadFiles)}
-async function uploadFiles(e){const cat=$('#uploadCategory').value;for(const file of e.target.files){const fd=new FormData();fd.append('category',cat);fd.append('file',file);const r=await fetch('/api/batches/'+current.id+'/upload',{method:'POST',body:fd});if(!r.ok){const d=await r.json();alert(d.error||'上传失败')}}await selectBatch(current.id)}
+async function uploadFiles(e){const finish=beginWork();try{const cat=$('#uploadCategory').value;const files=Array.from(e.target.files);await runUploadTasks(files,cat,100);await api('/api/batches/'+current.id+'/validate',{method:'POST'});await selectBatch(current.id)}finally{finish()}}
 function collect(id){const out={};document.querySelectorAll(`[data-id="${id}"]`).forEach(el=>{const k=el.dataset.k;if(k!=='category')out[k]=el.value}); const cat=document.querySelector(`[data-id="${id}"][data-k="category"]`); if(cat)out.category=cat.value;return out}
 async function saveFile(id){await api('/api/files/'+id+'/review',{method:'POST',body:JSON.stringify(collect(id))});await selectBatch(current.id)}
 async function passFile(id){await api('/api/files/'+id+'/review',{method:'POST',body:JSON.stringify({...collect(id),status:'PASS'})});await selectBatch(current.id)}
@@ -1325,6 +1400,26 @@ loadBatches();
 
 STORE = Store()
 OCR_SEMAPHORE = threading.BoundedSemaphore(OCR_CONCURRENCY)
+
+
+class LocalInvoiceServer(ThreadingHTTPServer):
+    # Join request threads before closing SQLite and returning from main().
+    daemon_threads = False
+    block_on_close = True
+
+    def __init__(self, *args, **kwargs):
+        self.lifecycle_lock = threading.Lock()
+        self.active_operations = 0
+        self.stopping = False
+        self.exit_token = uuid.uuid4().hex
+        self.instance_id = uuid.uuid4().hex
+        super().__init__(*args, **kwargs)
+
+    def get_request(self):
+        connection, address = super().get_request()
+        # Idle browser connections must not keep a stopped app alive forever.
+        connection.settimeout(10)
+        return connection, address
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1348,21 +1443,53 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         return json.loads(self.rfile.read(length) or b"{}")
 
+    def run_operation(self, operation) -> None:
+        with self.server.lifecycle_lock:
+            if self.server.stopping:
+                self.send_error_json("程序正在退出，请重新打开后再操作", 503)
+                return
+            self.server.active_operations += 1
+        try:
+            operation()
+        finally:
+            with self.server.lifecycle_lock:
+                self.server.active_operations -= 1
+
+    def shutdown_program(self) -> None:
+        token = self.headers.get("X-Exit-Token", "")
+        if not hmac.compare_digest(token.encode(), self.server.exit_token.encode()):
+            self.send_error_json("退出请求无效，请刷新页面后重试", 403)
+            return
+        with self.server.lifecycle_lock:
+            if self.server.stopping:
+                self.send_error_json("程序正在退出", 409)
+                return
+            if self.server.active_operations:
+                self.send_error_json("仍有上传、识别、保存或归档任务，请等待完成后再退出", 409)
+                return
+            self.server.stopping = True
+        # shutdown() must run outside serve_forever's thread, after replying.
+        try:
+            self.send_json({"stopping": True, "instance_id": self.server.instance_id})
+            self.wfile.flush()
+        finally:
+            threading.Thread(target=self.server.shutdown, name="invoice-shutdown").start()
+
     def do_GET(self) -> None:
         path = urllib.parse.urlparse(self.path).path
+        if path == "/api/lifecycle":
+            self.send_json({"stopping": self.server.stopping, "instance_id": self.server.instance_id})
+            return
         if path in {"/", "/index.html"}:
             page = HTML.replace(
+                '<div class="small">数据只保存在本机 data/ 目录</div>',
+                '<div class="app-actions"><button id="exitProgram" type="button" class="btn secondary exit-button" onclick="exitProgram()">退出程序</button><div id="exitStatus" class="exit-status" role="status" aria-live="polite"></div></div>',
+            ).replace(
                 '<div class="batch-title">${esc(b.name)}</div>',
                 '<div class="batch-title">${esc(b.name)}</div><button class="btn danger" style="margin-top:8px;padding:5px 8px;font-size:12px" onclick="event.stopPropagation();deleteBatch(\'${b.id}\')">删除批次</button>',
             ).replace(
                 "async function loadBatches()",
-                MATCH_JS + "\nasync function deleteBatch(id){if(!confirm('确定删除这个批次及其全部文件和归档包吗？此操作不可恢复。'))return;await api('/api/batches/'+id,{method:'DELETE'});if(current&&current.id===id)current=null;await loadBatches();if(!current)$('#workspace').innerHTML='<div class=\"empty\">请先创建或选择一个批次</div>';else render()}\nasync function loadBatches()",
-            ).replace(
-                "const r=await fetch('/api/batches/'+current.id+'/upload',{method:'POST',body:fd});if(!r.ok){const d=await r.json();alert(d.error||'上传失败')}",
-                "const r=await fetch('/api/batches/'+current.id+'/upload',{method:'POST',body:fd});const d=await r.json();if(!r.ok){alert(d.error||'上传失败')}else if(d.duplicate_removed){alert(d.message||'重复文件已删除')}",
-            ).replace(
-                "async function uploadFiles(e){const cat=$('#uploadCategory').value;for(const file of e.target.files){const fd=new FormData();fd.append('category',cat);fd.append('file',file);const r=await fetch('/api/batches/'+current.id+'/upload',{method:'POST',body:fd});if(!r.ok){const d=await r.json();alert(d.error||'上传失败')}}await selectBatch(current.id)}",
-                "async function uploadFiles(e){const cat=$('#uploadCategory').value;const files=Array.from(e.target.files);await runUploadTasks(files,cat,100);await api('/api/batches/'+current.id+'/validate',{method:'POST'});await selectBatch(current.id)}",
+                EXIT_JS.replace('__EXIT_TOKEN__', self.server.exit_token) + MATCH_JS + "\nasync function deleteBatch(id){if(!confirm('确定删除这个批次及其全部文件和归档包吗？此操作不可恢复。'))return;await api('/api/batches/'+id,{method:'DELETE'});if(current&&current.id===id)current=null;await loadBatches();if(!current)$('#workspace').innerHTML='<div class=\"empty\">请先创建或选择一个批次</div>';else render()}\nasync function loadBatches()",
             ).replace(
                 "async function selectBatch(id){current=await api('/api/batches/'+id);render();loadBatches()}",
                 "async function selectBatch(id){const scrollState=captureScrollState();current=await api('/api/batches/'+id);render();await loadBatches();restoreScrollState(scrollState)}",
@@ -1395,7 +1522,7 @@ class Handler(BaseHTTPRequestHandler):
                 "<button class=\"preview-name\" onclick=\"previewFile('${file.id}')\">${esc(file.original_name)}</button><div class=\"small\">",
             ).replace(
                 '<div class="error">${esc((file.errors||[]).join(\'；\'))}</div>',
-                '<div class="file-error">${renderErrorSummary(file.errors)}</div>',
+                '<div class="file-error">${renderErrorSummary(file.errors,file.duplicate_invoices)}</div>',
             ).replace(
                 '<div style="overflow:auto;margin-top:15px"><table',
                 '<div class="files-scroll" style="margin-top:15px"><table',
@@ -1451,6 +1578,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_DELETE(self) -> None:
+        self.run_operation(self.handle_delete)
+
+    def handle_delete(self) -> None:
         path = urllib.parse.urlparse(self.path).path
         m = re.fullmatch(r"/api/files/([^/]+)", path)
         if m:
@@ -1476,6 +1606,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json("批次删除失败，请查看终端日志", 500)
 
     def do_POST(self) -> None:
+        if urllib.parse.urlparse(self.path).path == "/api/shutdown":
+            self.shutdown_program()
+        else:
+            self.run_operation(self.handle_post)
+
+    def handle_post(self) -> None:
         path = urllib.parse.urlparse(self.path).path
         try:
             if path == "/api/batches":
@@ -1539,7 +1675,7 @@ def main() -> None:
         print(f"OK: Python {os.sys.version.split()[0]}, data={DATA_ROOT}")
         return
     try:
-        server = ThreadingHTTPServer((args.host, args.port), Handler)
+        server = LocalInvoiceServer((args.host, args.port), Handler)
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE and args.open_browser:
             print(f"本地发票整理已经运行：http://{args.host}:{args.port}")
@@ -1548,14 +1684,20 @@ def main() -> None:
         raise
     print(f"本地发票整理已启动：http://{args.host}:{args.port}")
     print(f"数据目录：{DATA_ROOT}")
+    browser_timer = None
     if args.open_browser:
-        threading.Timer(0.6, lambda: webbrowser.open(f"http://{args.host}:{args.port}")).start()
+        browser_timer = threading.Timer(0.6, lambda: webbrowser.open(f"http://{args.host}:{args.port}"))
+        browser_timer.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n已停止")
     finally:
+        if browser_timer:
+            browser_timer.cancel()
         server.server_close()
+        STORE.db.close()
+        print("本地发票整理已完全退出，端口已释放")
 
 
 if __name__ == "__main__":

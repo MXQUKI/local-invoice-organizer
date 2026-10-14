@@ -1,3 +1,4 @@
-# Only needed when creating a single-file executable with PyInstaller.
+# Packaging tools and the PDF text extraction dependency bundled into the app.
 pyinstaller>=6.0
 Pillow>=10.0
+pypdf>=6.0

@@ -104,7 +104,7 @@ def run_deepseek_vision(image_path: Path) -> str:
     if not api_key:
         raise RuntimeError("未设置 DEEPSEEK_API_KEY")
     base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
-    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash-vision-exp")
+    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
     prompt = os.environ.get(
         "DEEPSEEK_VISION_PROMPT",
         """请理解这张付款凭证图片，只提取最终实际付款金额。只输出 JSON，不要 Markdown，不要解释，格式必须是：

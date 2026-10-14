@@ -51,7 +51,7 @@
 - 建议安装 Tesseract；macOS 构建包还可以使用 macOS Vision OCR。
 - DeepSeek Vision 为可选能力，需要 API Key 和网络连接。
 
-主程序尽量使用 Python 标准库，运行时不要求安装完整依赖包；构建 DMG/EXE 需要安装 requirements-build.txt。
+发票 PDF 文字提取建议安装 `pypdf>=6.0`，以使用和安装包一致的文字排序与关键词检索流程；其他已有文字提取工具作为兼容后备。构建 DMG/EXE 需要安装 requirements-build.txt。
 
 ## 快速开始
 
@@ -62,6 +62,7 @@ git clone <你的仓库地址>
 cd 本地发票整理
 python3 -m venv .venv
 source .venv/bin/activate
+python3 -m pip install "pypdf>=6.0"
 python3 app.py --open-browser
 ~~~
 
@@ -72,10 +73,13 @@ git clone <你的仓库地址>
 cd 本地发票整理
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
+py -m pip install "pypdf>=6.0"
 py app.py --open-browser
 ~~~
 
-打开 http://127.0.0.1:8765，停止服务按 Ctrl+C。
+打开 http://127.0.0.1:8765。点击页面右上角“退出程序”并确认，可停止后台服务、关闭数据库连接并释放端口；页面提示“程序已退出”后可关闭浏览器标签。仅关闭网页不会停止后台程序。终端启动时也可按 Ctrl+C 停止。
+
+上传、识别、保存或归档期间暂不能退出，请等待任务完成。退出会保留已保存的批次、原始文件和归档包；尚未保存的页面修改不会保留。更新安装包前请先退出旧程序，再启动新版，避免仍连接到旧版后台。
 
 检查环境但不启动服务：
 
@@ -97,12 +101,14 @@ python3 app.py --port 8766 --open-browser
 2. 在上传区域选择“发票”或“购买凭证”。
 3. 批量上传 PDF、PNG、JPG/JPEG、CSV、XLSX 或 TXT 文件。
 4. 查看识别结果和 DeepSeek 处理进度。
-5. 在“已匹配池”和“未匹配池”中确认关系，可多选拖拽凭证。
+5. 在“已匹配池”和“未匹配池”中确认关系，可多选拖拽凭证。两个匹配池只显示单张金额超过当前批次购买凭证阈值的发票；低于或等于阈值的发票仍可在下方文件表格查看、审核和归档，金额待补录的发票需先在表格中填写金额。
 6. 人工补录缺失字段，或点击文件名预览原始文件。
 7. 点击“重新核验”，处理 NEEDS_REVIEW、MULTI_ORDER_REVIEW 和 INCOMPLETE。
 8. 核验通过后点击“生成 ZIP”。
 
 文件表格中的“删除”按钮可以删除单个发票或购买凭证。删除发票时，关联凭证会保留但移回未匹配池；删除凭证时，只删除该凭证。删除任意文件都会使旧归档包失效，需要重新核验并生成 ZIP。
+
+同一批次内发票号码重复时，发票卡片和文件表格会显示重复号码及其他重复文件的原文件名；展开“重复发票”可点击文件名预览。同名文件会附上文件 ID 前八位以便区分。修改号码或删除重复文件后会重新核验，自动清除已解除的重复提示；旧批次点击“重新核验”也能补全具体文件名。完全相同的文件仍按文件哈希去重，提示中会说明保留的是哪份文件。
 
 重新加载批次数据时，页面会保留工作区、匹配区、文件表格和错误详情的滚动位置。
 
@@ -114,15 +120,17 @@ python3 app.py --port 8766 --open-browser
 
 ~~~text
 读取 PDF 内嵌文字
-    ├── 有文字层：直接解析发票字段，不调用 OCR
+    ├── 有文字层：按文字坐标恢复行列，再按关键词检索字段
     └── 无文字层：转换页面图片，再调用 OCR
 ~~~
 
-PDF 有文字层但字段不完整时，不会重复 OCR，缺失字段进入人工审核。
+PDF 有文字层时，程序直接读取内嵌文字，依据文字坐标恢复标签与内容的对应关系，再检索“发票号码”“开票日期”“名称”“统一社会信用代码/纳税人识别号”和“价税合计（小写）”。购买方和销售方分开解析，不将整份文档去掉换行后拼接搜索。无法确定字段或出现冲突时保留为空并进入人工审核，不会用文件名或视觉模型猜测。有文字层但字段不完整时，不会重复 OCR。
+
+打包依赖包含 `pypdf`，安装包与源码使用相同的文字提取路径。已有批次保存的是上传当时的结果，“重新核验”只校验已保存字段；更新解析器后，可新建批次重新上传原文件以重新识别。在原批次直接重复上传会触发文件去重，不会更新识别结果。
 
 ### 购买凭证图片
 
-启用 DeepSeek 时，图片发送到 deepseek-v4-flash-vision-exp，只请求最终实付金额和判断依据。优惠金额、商品单价、订单金额和“共减”金额不直接作为最终付款金额。
+启用 DeepSeek 时，图片发送到官方当前推荐的 `deepseek-flash` 模型，只请求最终实付金额和判断依据。优惠金额、商品单价、订单金额和“共减”金额不直接作为最终付款金额。
 
 模型返回 payment_amount 为 null、图片无法确认、API 失败或格式异常时进入人工复核。未配置 DeepSeek 时，程序可以使用本地 macOS Vision 或 Tesseract，但本地识别结果仍需人工核对。
 
@@ -146,7 +154,9 @@ $env:DEEPSEEK_VISION_ENABLED = "1"
 py app.py --open-browser
 ~~~
 
-默认 Base URL 为 https://api.deepseek.com，模型为 deepseek-v4-flash-vision-exp。可用 DEEPSEEK_BASE_URL、DEEPSEEK_MODEL 和 DEEPSEEK_TIMEOUT 覆盖。程序使用 /chat/completions 接口，以原始图片字节编码为 Base64 data:image/... 的 image_url 发送，不会压缩或修改凭证图片。批量上传时，系统会并发处理最多 20 个文件，并在全部上传完成后统一执行一次匹配和核验，避免重复扫描批次。
+默认 Base URL 为 `https://api.deepseek.com`，模型为 `deepseek-flash`。可用 `DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL` 和 `DEEPSEEK_TIMEOUT` 覆盖。程序使用 `/chat/completions` 接口，以原始图片字节编码为 Base64 `data:image/...` 的 `image_url` 发送，并使用 `detail: high` 保留原图。批量上传时，系统会并发处理最多 100 个文件，并在全部上传完成后统一执行一次匹配和核验，避免重复扫描批次。
+
+根据 [DeepSeek 快速开始](https://api-docs.deepseek.com/zh-cn/) 和 [图像理解文档](https://api-docs.deepseek.com/zh-cn/guides/vision)，旧模型名 `deepseek-v4-flash` 和 `deepseek-v4-flash-vision-exp` 虽仍可调用，但对应模型已下线，请求会由最新 Flash 模型承接。新配置应使用 `deepseek-flash`。
 
 测试 API：
 
@@ -277,7 +287,7 @@ DEEPSEEK_API_KEY="新的 API Key" ./build_macos.sh
 
 ~~~bash
 DEEPSEEK_API_KEY="新的 API Key" \
-DEEPSEEK_MODEL="deepseek-v4-flash-vision-exp" \
+DEEPSEEK_MODEL="deepseek-flash" \
 DEEPSEEK_BASE_URL="https://api.deepseek.com" \
 ./build_macos.sh
 ~~~
@@ -324,6 +334,7 @@ $env:DEEPSEEK_API_KEY = "你的 API Key"
 
 ~~~text
 app.py                       本地服务、网页、核验、匹配和归档
+invoice_text.py              PDF 内嵌文字排序与发票关键词检索
 ocr_image.py                 图片、扫描 PDF 和 DeepSeek Vision 识别
 evaluate_deepseek_samples.py DeepSeek 样例批量测试
 macos_vision_ocr.swift       macOS Vision OCR 源码

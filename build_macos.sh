@@ -81,6 +81,7 @@ else
   echo "WARNING: building a Python-dependent wrapper, not a distributable app." >&2
   mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
   cp app.py "$APP/Contents/Resources/app.py"
+  cp invoice_text.py "$APP/Contents/Resources/invoice_text.py"
   cp ocr_image.py "$APP/Contents/Resources/ocr_image.py"
   cp README.md "$APP/Contents/Resources/README.md"
   if [[ -n "$ICON_ICNS" ]]; then cp "$ICON_ICNS" "$APP/Contents/Resources/icon.icns"; fi
